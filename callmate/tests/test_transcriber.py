@@ -1,11 +1,14 @@
-"""Tests for transcriber."""
+"""Tests for transcriber (Deepgram Listen V2)."""
 import pytest
 from callmate.core.transcriber import (
     Transcriber,
     MockTranscriberBackend,
-    DeepgramBackend,
+    DeepgramV2Backend,
     create_transcriber,
     SPEAKER_MAP,
+    MODEL,
+    EAGER_EOT_THRESHOLD,
+    EOT_THRESHOLD,
 )
 
 
@@ -22,122 +25,111 @@ class TestSpeakerMap:
 
 class TestMockTranscriber:
     def test_start_stop(self):
-        backend = MockTranscriberBackend()
-        backend.start()
-        assert backend.is_connected() is True
-        backend.stop()
-        assert backend.is_connected() is False
+        b = MockTranscriberBackend()
+        b.start()
+        assert b.is_connected() is True
+        b.stop()
+        assert b.is_connected() is False
 
     def test_send_audio(self):
-        backend = MockTranscriberBackend()
-        backend.start()
-        backend.send_audio(b"\x00\x01\x02")
-        assert len(backend._received_chunks) == 1
-        backend.stop()
+        b = MockTranscriberBackend()
+        b.start()
+        b.send_audio(b"\x00\x01")
+        assert len(b._received_chunks) == 1
+        b.stop()
 
     def test_inject_transcript(self):
-        backend = MockTranscriberBackend()
-        results = []
-        backend.set_callbacks(
-            on_transcript=lambda t, s, f: results.append((t, s, f)),
-        )
-        backend.inject_transcript("你好", 0, True)
-        assert results == [("你好", 0, True)]
+        b = MockTranscriberBackend()
+        r = []
+        b.set_callbacks(on_transcript=lambda t, s, f: r.append((t, s, f)))
+        b.inject_transcript("你好", 0, True)
+        assert r == [("你好", 0, True)]
 
     def test_inject_utterance(self):
-        backend = MockTranscriberBackend()
-        results = []
-        backend.set_callbacks(on_utterance=lambda t, s: results.append((t, s)))
-        backend.inject_utterance("实验进展如何", 1)
-        assert results == [("实验进展如何", 1)]
+        b = MockTranscriberBackend()
+        r = []
+        b.set_callbacks(on_utterance=lambda t, s: r.append((t, s)))
+        b.inject_utterance("实验进展如何", 1)
+        assert r == [("实验进展如何", 1)]
 
-    def test_multiple_callbacks(self):
-        backend = MockTranscriberBackend()
-        transcripts = []
-        utterances = []
-        backend.set_callbacks(
-            on_transcript=lambda t, s, f: transcripts.append((t, s, f)),
-            on_utterance=lambda t, s: utterances.append((t, s)),
-        )
-        backend.inject_transcript("你好", 0, False)
-        backend.inject_utterance("你好", 0)
-        assert len(transcripts) == 1
-        assert len(utterances) == 1
+    def test_inject_eager_eot(self):
+        b = MockTranscriberBackend()
+        r = []
+        b.set_callbacks(on_eager_eot=lambda t, s: r.append((t, s)))
+        b.inject_eager_eot("好的", 0)
+        assert r == [("好的", 0)]
 
 
 class TestTranscriber:
     def test_mock_fallback(self):
-        t = create_transcriber()  # no API key → mock
+        t = create_transcriber()
         assert t.is_mock is True
 
     def test_start_stop_mock(self):
         t = create_transcriber()
         t.on_transcript(lambda text, role, is_final: None)
-        t.on_utterance(lambda text, role: None)
         t.start()
         t.stop()
 
-    def test_send_audio_no_crash(self):
-        t = create_transcriber()
+    def test_on_transcript_maps_speaker(self):
+        b = MockTranscriberBackend()
+        t = Transcriber(backend=b)
+        r = []
+        t.on_transcript(lambda text, role, is_final: r.append((text, role, is_final)))
         t.start()
-        t.send_audio(b"\x00" * 3200)  # typical chunk size
-        t.stop()
+        b.inject_transcript("你好", 0, True)
+        assert r == [("你好", "other", True)]
 
-    def test_transcript_maps_speaker(self):
-        backend = MockTranscriberBackend()
-        t = Transcriber(backend=backend)
-        results = []
-        t.on_transcript(lambda text, role, is_final: results.append((text, role, is_final)))
+    def test_on_utterance_maps_speaker(self):
+        b = MockTranscriberBackend()
+        t = Transcriber(backend=b)
+        r = []
+        t.on_utterance(lambda text, role: r.append((text, role)))
         t.start()
-        backend.inject_transcript("你好", 0, True)
-        assert results == [("你好", "other", True)]
+        b.inject_utterance("实验进展", 1)
+        assert r == [("实验进展", "user")]
 
-    def test_utterance_maps_speaker(self):
-        backend = MockTranscriberBackend()
-        t = Transcriber(backend=backend)
-        results = []
-        t.on_utterance(lambda text, role: results.append((text, role)))
+    def test_on_eager_eot_maps_speaker(self):
+        b = MockTranscriberBackend()
+        t = Transcriber(backend=b)
+        r = []
+        t.on_eager_eot(lambda text, role: r.append((text, role)))
         t.start()
-        backend.inject_utterance("实验进展如何", 1)
-        assert results == [("实验进展如何", "user")]
+        b.inject_eager_eot("好的", 0)
+        assert r == [("好的", "other")]
 
     def test_stop_before_start(self):
         t = create_transcriber()
-        t.stop()  # should not crash
+        t.stop()
 
-    def test_send_before_start(self):
+    def test_send_audio_before_start(self):
         t = create_transcriber()
-        t.send_audio(b"test")  # should not crash
+        t.send_audio(b"test")
 
 
 class TestDeepgramBackend:
     def test_no_api_key(self):
-        """Deepgram backend requires API key."""
-        backend = DeepgramBackend(api_key="")
-        # Should not crash but connection will fail
-        assert backend.is_connected() is False
+        b = DeepgramV2Backend(api_key="")
+        assert b.is_connected() is False
 
-    def test_build_url_contains_params(self):
-        backend = DeepgramBackend(api_key="test_key")
-        url = backend._build_url()
-        assert "api.deepgram.com" in url
-        assert "diarize=true" in url
-        assert "encoding=linear16" in url
-        assert "sample_rate=16000" in url
-        assert "model=nova-2" in url
+    def test_configured_values(self):
+        b = DeepgramV2Backend(api_key="test", model=MODEL)
+        assert b._model == "flux-general-en"
+        assert b._sample_rate == 16000
+        assert b._encoding == "linear16"
 
-    def test_build_url_with_auth(self):
-        backend = DeepgramBackend(api_key="sk_test_123")
-        url = backend._build_url()
-        # Auth is via headers, not URL params
-        assert "sk_test" not in url
+    def test_eager_threshold(self):
+        assert EAGER_EOT_THRESHOLD == 0.5
+
+    def test_eot_threshold(self):
+        assert EOT_THRESHOLD == 0.8
 
 
 class TestFactory:
-    def test_create_with_key_uses_deepgram(self):
+    def test_create_with_key(self):
         t = create_transcriber(api_key="sk_test")
         assert t.is_mock is False
 
-    def test_create_without_key_uses_mock(self):
+    def test_create_without_key(self):
         t = create_transcriber()
         assert t.is_mock is True

@@ -1,23 +1,34 @@
-"""Speech-to-text via Deepgram real-time API.
+"""Speech-to-text via Deepgram Listen V2 API.
 
-Receives audio chunks from AudioCapture, sends them to Deepgram,
-and delivers real-time transcription results with speaker diarization.
+Uses the Deepgram SDK v7's `listen.v2.connect()` for real-time
+conversational speech recognition with built-in turn detection.
+
+The V2 API provides turn events that map directly to our design:
+  - Update      → interim transcript (ongoing)
+  - StartOfTurn → someone started speaking
+  - EagerEndOfTurn → speculative execution trigger
+  - EndOfTurn   → final transcript, trigger LLM advice
+  - TurnResumed → false alarm, cancel pending advice
 
 Usage:
     transcriber = Transcriber(api_key="...")
-    transcriber.on_transcript(lambda text, speaker, is_final: ...)
-    transcriber.on_utterance(lambda text, speaker: ...)
+    transcriber.on_transcript(lambda text, role, is_final: ...)
+    transcriber.on_utterance(lambda text, role: ...)
     transcriber.start()
-    transcriber.send_audio(chunk)   # called repeatedly
+    transcriber.send_audio(chunk)
     transcriber.stop()
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
+
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
 
 
 # ---------------------------------------------------------------------------
@@ -25,11 +36,10 @@ from typing import Callable, Optional
 # ---------------------------------------------------------------------------
 
 SAMPLE_RATE = 16000
-CHANNELS = 1
 ENCODING = "linear16"
-
-# Map Deepgram speaker IDs to our roles
-SPEAKER_MAP = {0: "other", 1: "user"}
+MODEL = "flux-general-en"
+EAGER_EOT_THRESHOLD = 0.5
+EOT_THRESHOLD = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +51,14 @@ class TranscriberBackend(ABC):
 
     @abstractmethod
     def start(self) -> None:
-        """Open connection to STT service."""
         ...
 
     @abstractmethod
     def send_audio(self, chunk: bytes) -> None:
-        """Send an audio chunk for transcription."""
         ...
 
     @abstractmethod
     def stop(self) -> None:
-        """Close connection."""
         ...
 
     @abstractmethod
@@ -60,128 +67,137 @@ class TranscriberBackend(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Deepgram backend
+# Deepgram Listen V2 backend
 # ---------------------------------------------------------------------------
 
-class DeepgramBackend(TranscriberBackend):
-    """Backend using Deepgram's real-time WebSocket API."""
+class DeepgramV2Backend(TranscriberBackend):
+    """Backend using Deepgram SDK Listen V2."""
 
     def __init__(
         self,
         api_key: str,
+        model: str = MODEL,
         sample_rate: int = SAMPLE_RATE,
-        channels: int = CHANNELS,
+        encoding: str = ENCODING,
     ):
         self._api_key = api_key
+        self._model = model
         self._sample_rate = sample_rate
-        self._channels = channels
-        self._socket: Optional["WebSocket"] = None
+        self._encoding = encoding
+        self._client: Optional[DeepgramClient] = None
+        self._connection = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+        # Callbacks
         self._on_transcript: Optional[Callable] = None
         self._on_utterance: Optional[Callable] = None
+        self._on_eager_eot: Optional[Callable] = None
 
     def set_callbacks(
         self,
         on_transcript: Optional[Callable[[str, int, bool], None]] = None,
         on_utterance: Optional[Callable[[str, int], None]] = None,
+        on_eager_eot: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self._on_transcript = on_transcript
         self._on_utterance = on_utterance
+        self._on_eager_eot = on_eager_eot
 
     def start(self) -> None:
-        import websockets.sync.client
-
-        url = self._build_url()
-        self._socket = websockets.sync.client.connect(url)
-
-        # Start a listener thread for incoming messages
-        self._listener_thread = threading.Thread(target=self._listen, daemon=True)
-        self._listener_thread.start()
+        self._client = DeepgramClient(api_key=self._api_key)
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def send_audio(self, chunk: bytes) -> None:
-        if self._socket:
+        if self._connection:
             try:
-                self._socket.send(chunk)
+                self._connection.send_media(chunk)
             except Exception:
                 pass
 
     def stop(self) -> None:
-        if self._socket:
-            # Send close message
+        self._running = False
+        if self._connection:
             try:
-                self._socket.send(json.dumps({"type": "CloseStream"}))
-                self._socket.close()
+                self._connection.send_close_stream()
             except Exception:
                 pass
-            self._socket = None
+            self._connection = None
 
     def is_connected(self) -> bool:
-        return self._socket is not None
+        return self._connection is not None
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _build_url(self) -> str:
-        params = {
-            "encoding": ENCODING,
-            "sample_rate": self._sample_rate,
-            "channels": self._channels,
-            "model": "nova-2",
-            "smart_format": "true",
-            "diarize": "true",
-            "endpointing": "200",
-            "utterance_end_ms": "1000",
-        }
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        return f"wss://api.deepgram.com/v1/listen?{query}"
+    def _run(self) -> None:
+        """Background thread: open connection and listen for messages."""
+        try:
+            with self._client.listen.v2.connect(
+                model=self._model,
+                encoding=self._encoding,
+                sample_rate=self._sample_rate,
+                eager_eot_threshold=EAGER_EOT_THRESHOLD,
+                eot_threshold=EOT_THRESHOLD,
+            ) as connection:
+                self._connection = connection
 
-    def _listen(self) -> None:
-        """Background thread: read messages from Deepgram."""
-        import websockets
+                connection.on(EventType.OPEN, lambda _: None)
+                connection.on(EventType.CLOSE, lambda _: self._stop_self())
+                connection.on(EventType.ERROR, lambda err: None)
 
-        while self._socket:
-            try:
-                message = self._socket.recv()
-                if isinstance(message, bytes):
-                    continue
-                self._handle_message(json.loads(message))
-            except websockets.exceptions.ConnectionClosed:
-                break
-            except Exception:
-                break
+                # Process messages inline
+                connection.start_listening()
+                for msg in connection:
+                    if not self._running:
+                        break
+                    self._handle_message(msg)
 
-    def _handle_message(self, data: dict) -> None:
-        msg_type = data.get("type", "")
+        except Exception:
+            pass
+        finally:
+            self._connection = None
 
-        if msg_type == "Results":
-            self._handle_results(data)
-        elif msg_type == "UtteranceEnd":
-            self._handle_utterance_end(data)
+    def _stop_self(self) -> None:
+        self._running = False
 
-    def _handle_results(self, data: dict) -> None:
-        channel = data.get("channel", {})
-        alternatives = channel.get("alternatives", [])
-        if not alternatives:
+    def _handle_message(self, msg) -> None:
+        """Handle a parsed V2 message."""
+        msg_type = getattr(msg, "type", "")
+
+        if msg_type != "TurnInfo":
             return
 
-        alt = alternatives[0]
-        transcript = alt.get("transcript", "").strip()
-        if not transcript:
+        event = getattr(msg, "event", None)
+        if event is None:
             return
 
-        is_final = data.get("is_final", False)
-        # Get speaker from the first word
-        words = alt.get("words", [])
-        speaker = words[0].get("speaker", 0) if words else 0
+        event_name = getattr(event, "value", "") if hasattr(event, "value") else str(event)
+        transcript = getattr(msg, "transcript", "")
+        turn_index = getattr(msg, "turn_index", 0)
 
-        if self._on_transcript:
-            self._on_transcript(transcript, speaker, is_final)
+        # Infer speaker from turn parity (0,2,4 → other; 1,3,5 → user)
+        speaker = 0 if turn_index % 2 == 0 else 1
 
-    def _handle_utterance_end(self, data: dict) -> None:
-        transcript = data.get("transcript", "").strip()
-        speaker = data.get("speaker", 0)
-        if transcript and self._on_utterance:
-            self._on_utterance(transcript, speaker)
+        if event_name == "Update" and transcript:
+            # Interim transcript update
+            if self._on_transcript:
+                self._on_transcript(transcript, speaker, is_final=False)
+
+        elif event_name == "EagerEndOfTurn" and transcript:
+            # Speculative: user might be done
+            if self._on_eager_eot:
+                self._on_eager_eot(transcript, speaker)
+
+        elif event_name == "EndOfTurn" and transcript:
+            # Final transcript for this turn
+            if self._on_transcript:
+                self._on_transcript(transcript, speaker, is_final=True)
+            if self._on_utterance:
+                self._on_utterance(transcript, speaker)
 
 
 # ---------------------------------------------------------------------------
@@ -189,21 +205,24 @@ class DeepgramBackend(TranscriberBackend):
 # ---------------------------------------------------------------------------
 
 class MockTranscriberBackend(TranscriberBackend):
-    """Mock backend that returns canned transcripts."""
+    """Mock backend for testing. Inject transcripts/utterances manually."""
 
     def __init__(self):
         self._connected = False
         self._on_transcript: Optional[Callable] = None
         self._on_utterance: Optional[Callable] = None
+        self._on_eager_eot: Optional[Callable] = None
         self._received_chunks: list[bytes] = []
 
     def set_callbacks(
         self,
         on_transcript: Optional[Callable[[str, int, bool], None]] = None,
         on_utterance: Optional[Callable[[str, int], None]] = None,
+        on_eager_eot: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self._on_transcript = on_transcript
         self._on_utterance = on_utterance
+        self._on_eager_eot = on_eager_eot
 
     def start(self) -> None:
         self._connected = True
@@ -218,60 +237,61 @@ class MockTranscriberBackend(TranscriberBackend):
         return self._connected
 
     def inject_transcript(self, text: str, speaker: int = 0, is_final: bool = True) -> None:
-        """Simulate a transcript result (for testing)."""
         if self._on_transcript:
             self._on_transcript(text, speaker, is_final)
 
     def inject_utterance(self, text: str, speaker: int = 0) -> None:
-        """Simulate an utterance end event."""
         if self._on_utterance:
             self._on_utterance(text, speaker)
+
+    def inject_eager_eot(self, text: str, speaker: int = 0) -> None:
+        if self._on_eager_eot:
+            self._on_eager_eot(text, speaker)
 
 
 # ---------------------------------------------------------------------------
 # High-level Transcriber
 # ---------------------------------------------------------------------------
 
+SPEAKER_MAP = {0: "other", 1: "user"}
+
+
 class Transcriber:
     """High-level STT manager.
 
-    Automatically selects Deepgram backend when API key is provided,
-    falls back to Mock backend otherwise.
+    Wraps Deepgram V2 (real) or Mock backend with consistent callbacks.
     """
 
     def __init__(self, backend: Optional[TranscriberBackend] = None):
         self._backend = backend or MockTranscriberBackend()
+        self._on_transcript_cb: Optional[Callable] = None
+        self._on_utterance_cb: Optional[Callable] = None
+        self._on_eager_eot_cb: Optional[Callable] = None
 
     def on_transcript(self, callback: Callable[[str, str, bool], None]) -> None:
-        """Register callback for partial/final transcripts.
-
-        Args:
-            callback(text: str, role: "other"|"user", is_final: bool)
-        """
+        """Interim or final transcript. (text, role, is_final)"""
         self._on_transcript_cb = callback
 
     def on_utterance(self, callback: Callable[[str, str], None]) -> None:
-        """Register callback for completed utterances.
-
-        Args:
-            callback(text: str, role: "other"|"user")
-        """
+        """Completed utterance. (text, role)"""
         self._on_utterance_cb = callback
 
+    def on_eager_eot(self, callback: Callable[[str, str], None]) -> None:
+        """Speculative end-of-turn signal. (text, role)"""
+        self._on_eager_eot_cb = callback
+
     def start(self) -> None:
-        """Open connection to STT service."""
         self._backend.set_callbacks(
             on_transcript=self._wrap_transcript,
             on_utterance=self._wrap_utterance,
+            on_eager_eot=self._wrap_eager_eot,
         )
         self._backend.start()
 
     def send_audio(self, chunk: bytes) -> None:
-        """Send an audio chunk for transcription."""
         self._backend.send_audio(chunk)
 
     def stop(self) -> None:
-        """Close connection."""
         self._backend.stop()
 
     @property
@@ -279,18 +299,23 @@ class Transcriber:
         return isinstance(self._backend, MockTranscriberBackend)
 
     # ------------------------------------------------------------------
-    # Internal
+    # Internal wrappers
     # ------------------------------------------------------------------
 
     def _wrap_transcript(self, text: str, speaker: int, is_final: bool) -> None:
-        if hasattr(self, "_on_transcript_cb") and self._on_transcript_cb:
+        if self._on_transcript_cb:
             role = SPEAKER_MAP.get(speaker, "other")
             self._on_transcript_cb(text, role, is_final)
 
     def _wrap_utterance(self, text: str, speaker: int) -> None:
-        if hasattr(self, "_on_utterance_cb") and self._on_utterance_cb:
+        if self._on_utterance_cb:
             role = SPEAKER_MAP.get(speaker, "other")
             self._on_utterance_cb(text, role)
+
+    def _wrap_eager_eot(self, text: str, speaker: int) -> None:
+        if self._on_eager_eot_cb:
+            role = SPEAKER_MAP.get(speaker, "other")
+            self._on_eager_eot_cb(text, role)
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +323,8 @@ class Transcriber:
 # ---------------------------------------------------------------------------
 
 def create_transcriber(api_key: str = "") -> Transcriber:
-    """Create a Transcriber, real or mock based on API key presence."""
     if api_key:
-        backend = DeepgramBackend(api_key=api_key)
+        backend = DeepgramV2Backend(api_key=api_key)
     else:
         backend = MockTranscriberBackend()
     return Transcriber(backend=backend)
