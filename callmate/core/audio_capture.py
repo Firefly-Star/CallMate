@@ -7,6 +7,8 @@ Design:
   - Callback-based: sounddevice delivers audio chunks via a callback.
   - Device enumeration via sounddevice.query_devices().
   - Auto-fallback to MockBackend when no input devices found.
+  - sounddevice import is lazy (inside methods), so CI without
+    PortAudio can still import the module.
 
 Usage:
     capture = AudioCapture()
@@ -21,9 +23,6 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
-
-import sounddevice as sd
-import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -87,10 +86,11 @@ class SoundDeviceBackend(AudioBackend):
     """Backend using sounddevice (PortAudio)."""
 
     def __init__(self):
-        self._stream: Optional[sd.InputStream] = None
+        self._stream: Optional["sd.InputStream"] = None
 
     def is_available(self) -> bool:
         try:
+            import sounddevice as sd
             devices = sd.query_devices()
             return any(d["max_input_channels"] > 0 for d in devices)
         except Exception:
@@ -100,11 +100,13 @@ class SoundDeviceBackend(AudioBackend):
         result = []
         default_id = None
         try:
+            import sounddevice as sd
             default_id = sd.default.device[0]
         except Exception:
             pass
 
         try:
+            import sounddevice as sd
             devices = sd.query_devices()
             for i, d in enumerate(devices):
                 if d["max_input_channels"] > 0:
@@ -123,8 +125,10 @@ class SoundDeviceBackend(AudioBackend):
         device_id: int = 0,
         callback: Callable[[bytes], None] = lambda _: None,
     ) -> None:
+        import sounddevice as sd
+        import numpy as np
+
         def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-            # Convert numpy array to bytes (16-bit PCM)
             chunk = (indata * 32767).astype(np.int16).tobytes()
             callback(chunk)
 
