@@ -64,11 +64,11 @@ def _run_mock_loop(
     profile,
     cmd_handler: CommandHandler,
 ):
-    """Main mock loop: user types what the other person says."""
+    """Main mock loop: type what the other person says, then type your reply."""
     should_exit = False
+    expecting_reply = False
 
     while not should_exit:
-        # Wait for user input
         user_input = presenter.get_input()
 
         if not user_input:
@@ -81,42 +81,30 @@ def _run_mock_loop(
                 should_exit = True
                 cmd_handler.execute(cmd)
                 break
-
             response = cmd_handler.execute(cmd)
             if response:
-                presenter.set_status(response)
+                # Show multi-line output (like /help) in history
+                for line in response.split("\n"):
+                    presenter.add_message("system", line)
             continue
 
-        # Treat input as "what the other person said"
-        presenter.add_message("other", user_input)
-        dialogue_mgr.add_message("other", user_input)
+        if expecting_reply:
+            # User is typing their own response
+            presenter.add_message("user", user_input)
+            dialogue_mgr.add_message("user", user_input)
+            expecting_reply = False
+            presenter.set_status("")
+        else:
+            # User is typing what the other person said
+            presenter.add_message("other", user_input)
+            dialogue_mgr.add_message("other", user_input)
 
-        # Get suggestions from advisor
-        soul, profile_text, transcript = dialogue_mgr.build_prompt(profile)
-        suggestions = advisor.advise(soul, profile_text, transcript)
-
-        presenter.update_suggestions(suggestions)
-
-        # Let user type their own response
-        user_reply = presenter.get_input()
-
-        if not user_reply:
-            continue
-
-        cmd = CommandHandler.parse(user_reply)
-        if cmd:
-            if cmd.name == "quit":
-                should_exit = True
-                cmd_handler.execute(cmd)
-                break
-            response = cmd_handler.execute(cmd)
-            if response:
-                presenter.set_status(response)
-            continue
-
-        # Treat as user's spoken response
-        presenter.add_message("user", user_reply)
-        dialogue_mgr.add_message("user", user_reply)
+            # Get suggestions from advisor
+            soul, profile_text, transcript = dialogue_mgr.build_prompt(profile)
+            suggestions = advisor.advise(soul, profile_text, transcript)
+            presenter.update_suggestions(suggestions)
+            expecting_reply = True
+            presenter.set_status("输入你的回复，或输入对方说的话继续")
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ class Presenter:
     """Terminal UI for CallMate."""
 
     HEADER_HEIGHT = 1   # title bar
+    STATUS_HEIGHT = 1   # status message line
     INPUT_HEIGHT = 2    # input prompt + input line
     SUGGESTIONS_MAX = 6  # max lines for suggestions panel
 
@@ -87,7 +88,8 @@ class Presenter:
 
     def add_message(self, role: str, content: str) -> None:
         """Add a message to the conversation history."""
-        label = "你" if role == "user" else "对方"
+        label_map = {"user": "你", "other": "对方", "system": ""}
+        label = label_map.get(role, role)
         self._history.append((label, content))
         self._refresh()
 
@@ -140,13 +142,13 @@ class Presenter:
 
     def _history_area_height(self) -> int:
         """Number of rows available for conversation history."""
-        return self._rows - self.HEADER_HEIGHT - self.INPUT_HEIGHT - self.SUGGESTIONS_MAX
+        return self._rows - self.HEADER_HEIGHT - self.STATUS_HEIGHT - self.INPUT_HEIGHT - self.SUGGESTIONS_MAX
 
     def _history_start_row(self) -> int:
         return self.HEADER_HEIGHT + 1
 
     def _suggestions_start_row(self) -> int:
-        return self._history_start_row() + self._history_area_height()
+        return self._history_start_row() + self._history_area_height() + self.STATUS_HEIGHT
 
     def _input_row(self) -> int:
         return self._rows - 1
@@ -172,8 +174,16 @@ class Presenter:
     def _refresh(self) -> None:
         """Redraw the variable content areas (history + suggestions)."""
         self._draw_header()
+        self._draw_status()
         self._draw_history()
         self._draw_suggestions()
+
+    def _draw_status(self) -> None:
+        """Draw the status message line."""
+        row = self.HEADER_HEIGHT + 1 + self._history_area_height()
+        _move_to(row, 0)
+        msg = self._status_message[:self._cols - 1] if self._status_message else ""
+        sys.stdout.write(f"\033[K\033[90m{msg}\033[0m")
 
     def _draw_history(self) -> None:
         """Draw conversation history in the scrolling region."""
