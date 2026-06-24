@@ -1,29 +1,29 @@
-"""Audio capture via PulseAudio.
+"""Audio capture via sounddevice.
 
 Captures audio from microphone, virtual devices, or Bluetooth HFP
-using PulseAudio's `parec` command-line tool.
+using sounddevice (PortAudio).
 
 Design:
-  - Subprocess-based: spawns `parec` and reads PCM audio from stdout.
-  - Chunked callback: audio data is delivered in fixed-size chunks.
-  - Device enumeration via `pactl list sources`.
-  - Graceful fallback when no audio hardware is available.
+  - Callback-based: sounddevice delivers audio chunks via a callback.
+  - Device enumeration via sounddevice.query_devices().
+  - Auto-fallback to MockBackend when no input devices found.
 
 Usage:
     capture = AudioCapture()
     devices = capture.list_devices()
-    capture.start(device_name="default", callback=lambda chunk: ...)
+    capture.start(device_id=0, callback=lambda chunk: ...)
     ...
     capture.stop()
 """
 
 from __future__ import annotations
 
-import json
-import subprocess
-import shutil
+import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
+
+import sounddevice as sd
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -32,9 +32,8 @@ from typing import Callable, Optional
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-SAMPLE_WIDTH = 2  # 16-bit PCM
-CHUNK_MS = 100    # chunk size in milliseconds
-CHUNK_SIZE = int(SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * CHUNK_MS / 1000)
+CHUNK_MS = 100  # chunk size in milliseconds
+BLOCK_SIZE = int(SAMPLE_RATE * CHUNK_MS / 1000)  # samples per chunk
 
 
 # ---------------------------------------------------------------------------
@@ -44,13 +43,14 @@ CHUNK_SIZE = int(SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * CHUNK_MS / 1000)
 class AudioDevice:
     """Represents an audio input device."""
 
-    def __init__(self, name: str, description: str, is_monitor: bool = False):
+    def __init__(self, device_id: int, name: str, channels: int, is_default: bool = False):
+        self.device_id = device_id
         self.name = name
-        self.description = description
-        self.is_monitor = is_monitor
+        self.channels = channels
+        self.is_default = is_default
 
     def __repr__(self) -> str:
-        return f"AudioDevice({self.name}, {self.description})"
+        return f"AudioDevice({self.device_id}, {self.name})"
 
 
 # ---------------------------------------------------------------------------
@@ -58,111 +58,94 @@ class AudioDevice:
 # ---------------------------------------------------------------------------
 
 class AudioBackend(ABC):
-    """Abstract audio capture backend."""
-
     @abstractmethod
     def list_devices(self) -> list[AudioDevice]:
-        """List available audio input sources."""
         ...
 
     @abstractmethod
     def start_stream(
         self,
-        device_name: str,
+        device_id: int,
         callback: Callable[[bytes], None],
     ) -> None:
-        """Start capturing from a device.
-
-        Args:
-            device_name: PulseAudio source name.
-            callback: Called with each PCM audio chunk (bytes).
-        """
         ...
 
     @abstractmethod
     def stop_stream(self) -> None:
-        """Stop capturing."""
         ...
 
     @abstractmethod
     def is_available(self) -> bool:
-        """Check if PulseAudio is available on this system."""
         ...
 
 
 # ---------------------------------------------------------------------------
-# PulseAudio backend (production)
+# sounddevice backend
 # ---------------------------------------------------------------------------
 
-class PulseAudioBackend(AudioBackend):
-    """Backend using PulseAudio's parec and pactl commands."""
+class SoundDeviceBackend(AudioBackend):
+    """Backend using sounddevice (PortAudio)."""
 
     def __init__(self):
-        self._process: Optional[subprocess.Popen] = None
+        self._stream: Optional[sd.InputStream] = None
 
     def is_available(self) -> bool:
-        return shutil.which("parec") is not None and shutil.which("pactl") is not None
+        try:
+            devices = sd.query_devices()
+            return any(d["max_input_channels"] > 0 for d in devices)
+        except Exception:
+            return False
 
     def list_devices(self) -> list[AudioDevice]:
-        if not self.is_available():
-            return []
+        result = []
+        default_id = None
+        try:
+            default_id = sd.default.device[0]
+        except Exception:
+            pass
 
         try:
-            result = subprocess.run(
-                ["pactl", "list", "sources", "--format=json"],
-                capture_output=True, text=True, timeout=5,
-            )
-            devices = []
-            for src in json.loads(result.stdout):
-                name = src.get("name", "")
-                desc = src.get("description", name)
-                is_mon = src.get("monitor_of_source") is not None
-                devices.append(AudioDevice(name, desc, is_mon))
-            return devices
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-            return []
+            devices = sd.query_devices()
+            for i, d in enumerate(devices):
+                if d["max_input_channels"] > 0:
+                    result.append(AudioDevice(
+                        device_id=i,
+                        name=d["name"],
+                        channels=d["max_input_channels"],
+                        is_default=(i == default_id),
+                    ))
+        except Exception:
+            pass
+        return result
 
     def start_stream(
         self,
-        device_name: str = "@DEFAULT_SOURCE@",
+        device_id: int = 0,
         callback: Callable[[bytes], None] = lambda _: None,
     ) -> None:
-        if not self.is_available():
-            raise RuntimeError("PulseAudio is not available on this system")
-
-        cmd = [
-            "parec",
-            f"--device={device_name}",
-            f"--rate={SAMPLE_RATE}",
-            f"--channels={CHANNELS}",
-            f"--format=s16le",
-            "--raw",
-        ]
-        self._process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-
-        # Read loop in current thread — caller should run in a background thread
-        while self._process and self._process.poll() is None:
-            chunk = self._process.stdout.read(CHUNK_SIZE)
-            if not chunk:
-                break
+        def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
+            # Convert numpy array to bytes (16-bit PCM)
+            chunk = (indata * 32767).astype(np.int16).tobytes()
             callback(chunk)
 
+        self._stream = sd.InputStream(
+            device=device_id,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            blocksize=BLOCK_SIZE,
+            callback=_callback,
+        )
+        self._stream.start()
+
     def stop_stream(self) -> None:
-        if self._process:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            self._process = None
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
 
 # ---------------------------------------------------------------------------
-# Mock backend (testing / development without audio hardware)
+# Mock backend (testing / no audio hardware)
 # ---------------------------------------------------------------------------
 
 class MockAudioBackend(AudioBackend):
@@ -170,30 +153,28 @@ class MockAudioBackend(AudioBackend):
 
     def __init__(self):
         self._running = False
-        self._recorded_chunks: list[bytes] = []
-        self._devices = [
-            AudioDevice("alsa_input.pci-0000_00_1f.3.analog-stereo", "Built-in Microphone"),
-            AudioDevice("bluez_source.xx_xx_xx_xx_xx_xx", "Bluetooth HFP (Phone)"),
-        ]
+        self._callback: Optional[Callable] = None
 
     def is_available(self) -> bool:
         return True
 
     def list_devices(self) -> list[AudioDevice]:
-        return self._devices
+        return [
+            AudioDevice(0, "Mock Microphone", 1, is_default=True),
+            AudioDevice(1, "Mock Bluetooth HFP", 1),
+        ]
 
     def start_stream(
         self,
-        device_name: str = "default",
+        device_id: int = 0,
         callback: Callable[[bytes], None] = lambda _: None,
     ) -> None:
         self._running = True
-        # In mock mode, just store the device name and callback
-        self._device = device_name
         self._callback = callback
 
     def stop_stream(self) -> None:
         self._running = False
+        self._callback = None
 
     def feed_chunk(self, data: bytes) -> None:
         """Inject mock audio data (for testing)."""
@@ -206,42 +187,30 @@ class MockAudioBackend(AudioBackend):
 # ---------------------------------------------------------------------------
 
 class AudioCapture:
-    """High-level audio capture manager.
-
-    Automatically selects PulseAudio backend when available,
-    falls back to mock backend in development/testing.
-    """
+    """High-level audio capture manager."""
 
     def __init__(self, backend: Optional[AudioBackend] = None):
         if backend is None:
-            real = PulseAudioBackend()
+            real = SoundDeviceBackend()
             self._backend = real if real.is_available() else MockAudioBackend()
         else:
             self._backend = backend
         self._callback: Optional[Callable[[bytes], None]] = None
 
     def list_devices(self) -> list[AudioDevice]:
-        """List available audio input sources."""
         return self._backend.list_devices()
 
-    def start(self, device_name: str = "@DEFAULT_SOURCE@") -> None:
-        """Start capturing audio.
-
-        Captured chunks are delivered via the callback set by ``on_chunk()``.
-        """
+    def start(self, device_id: int = 0) -> None:
         if self._callback is None:
             raise RuntimeError("Set a callback via on_chunk() before starting")
-        self._backend.start_stream(device_name, self._callback)
+        self._backend.start_stream(device_id, self._callback)
 
     def stop(self) -> None:
-        """Stop capturing."""
         self._backend.stop_stream()
 
     def on_chunk(self, callback: Callable[[bytes], None]) -> None:
-        """Register a callback for audio chunks."""
         self._callback = callback
 
     @property
     def is_mock(self) -> bool:
-        """True if no real audio hardware was found."""
         return isinstance(self._backend, MockAudioBackend)

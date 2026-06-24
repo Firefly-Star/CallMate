@@ -7,7 +7,7 @@ dependencies:
   - pip
   - pip:
     - python-dotenv
-    - pulsectl
+    - sounddevice
     - numpy
     - deepgram-sdk
     - anthropic
