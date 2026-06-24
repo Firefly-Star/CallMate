@@ -1,0 +1,14 @@
+name: callmate
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - python-dotenv
+    - pulsectl
+    - numpy
+    - deepgram-sdk
+    - anthropic
+    - openai
