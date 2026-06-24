@@ -88,7 +88,7 @@ class Presenter:
 
     def add_message(self, role: str, content: str) -> None:
         """Add a message to the conversation history."""
-        label_map = {"user": "你", "other": "对方", "system": ""}
+        label_map = {"user": "你", "other": "对方", "system": "系统"}
         label = label_map.get(role, role)
         self._history.append((label, content))
         self._refresh()
@@ -192,8 +192,12 @@ class Presenter:
 
         # Determine which portion of history to show (scroll to bottom)
         total_lines = []
-        for role, content in self._history:
-            wrapped = self._wrap_text(f" {role}: {content}", self._cols)
+        for label, content in self._history:
+            if label:
+                line = f" {label}: {content}"
+            else:
+                line = f" {content}"
+            wrapped = self._wrap_text(line, self._cols)
             total_lines.extend(wrapped)
 
         # Show only the last `height` lines

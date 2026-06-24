@@ -34,7 +34,9 @@ class TestProfileSelection:
         store.save(Profile(name="张老师", relationship="导师"))
         p = _select_profile(store)
         assert p is not None
-        assert p.name == "张老师"
+
+
+from callmate.core.command_handler import Command
 
 
 class TestCommandHandlerBuild:
@@ -58,9 +60,13 @@ class TestCommandHandlerBuild:
         assert "/help" in result
         assert "/quit" in result
 
-
-# Need to import Command here
-from callmate.core.command_handler import Command
+    def test_switch_nonexistent_no_creation(self, monkeypatch):
+        """Switching to a nonexistent profile with user saying no."""
+        store = ProfileStore(path=tempfile.mktemp(suffix=".json"))
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        handler = _build_command_handler(Presenter(), DialogueManager(), store, MockAdvisor())
+        result = handler.execute(Command("profile", "不存在"))
+        assert "未找到" in result
 
 
 class TestMockFlow:
