@@ -156,6 +156,9 @@ def _run_mock_stream_loop(
         nonlocal pending_suggestions
         role = "other" if speaker == 0 else "user"
 
+        # Clear streaming display
+        presenter.clear_streaming()
+
         # Add to dialogue
         dialogue_mgr.add_message(role, text)
 
@@ -174,7 +177,9 @@ def _run_mock_stream_loop(
             presenter.update_suggestions([])
 
     streamer.on_utterance_end(on_utterance_end)
-    streamer.on_results(lambda text, speaker, is_final, speech_final: None)
+    streamer.on_results(lambda text, speaker, is_final, speech_final: (
+        presenter.show_streaming(text, speaker) if not is_final else None
+    ))
     streamer.on_speech_started(lambda speaker: presenter.set_status(
         "对方正在说话…" if speaker == 0 else ""
     ))

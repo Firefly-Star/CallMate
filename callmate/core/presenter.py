@@ -66,6 +66,7 @@ class Presenter:
         self._suggestions: list[dict] = []
         self._input_prompt = "> "
         self._status_message = ""
+        self._streaming: Optional[tuple[str, str]] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -101,6 +102,23 @@ class Presenter:
     def set_status(self, message: str) -> None:
         """Set a status message displayed in the header area."""
         self._status_message = message
+        self._refresh()
+
+    def show_streaming(self, text: str, speaker: int) -> None:
+        """Show streaming (interim) transcript.
+        
+        This updates a temporary line in the history area that gets
+        overwritten as new interim results arrive. When the utterance
+        is complete, use add_message() instead.
+        """
+        label_map = {0: "对方", 1: "你"}
+        label = label_map.get(speaker, "对方")
+        self._streaming = (label, text)
+        self._refresh()
+
+    def clear_streaming(self) -> None:
+        """Remove the streaming line after utterance is finalized."""
+        self._streaming = None
         self._refresh()
 
     def get_input(self) -> str:
@@ -199,6 +217,18 @@ class Presenter:
                 line = f" {content}"
             wrapped = self._wrap_text(line, self._cols)
             total_lines.extend(wrapped)
+
+        # Add streaming line (if any)
+        if self._streaming:
+            label, text = self._streaming
+            line = f" {label}: {text}"
+            wrapped = self._wrap_text(line, self._cols)
+            # Mark as streaming with dim text
+            for i, wl in enumerate(wrapped):
+                if i == 0:
+                    total_lines.append(f"\033[2m{wl}\033[0m")  # dim
+                else:
+                    total_lines.append(f"\033[2m{wl}\033[0m")
 
         # Show only the last `height` lines
         visible = total_lines[-height:] if len(total_lines) > height else total_lines
