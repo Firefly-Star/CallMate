@@ -12,3 +12,4 @@ dependencies:
     - deepgram-sdk
     - anthropic
     - openai
+    - pytest
