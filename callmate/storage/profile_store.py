@@ -44,20 +44,6 @@ class Profile:
         )
 
 
-_DEFAULT_PROFILES = [
-    Profile(
-        name="张老师",
-        relationship="研究生导师",
-        occasion="周报电话",
-        topics=["上周实验进展", "下周计划", "论文投稿"],
-        notes=[
-            "张老师比较注重时间观念",
-            "他喜欢学生先提出问题再给方案",
-        ],
-    ),
-]
-
-
 class ProfileStore:
     """Manages contact profiles stored as JSON."""
 
@@ -115,7 +101,7 @@ class ProfileStore:
         if path.exists():
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._write([asdict(p) for p in _DEFAULT_PROFILES])
+        self._write([])
 
     def _read(self) -> list[dict]:
         with open(self._path, "r", encoding="utf-8") as f:
