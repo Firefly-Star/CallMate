@@ -4,6 +4,7 @@
 Usage:
     callmate --mock                   # Mock mode (type text, no audio)
     callmate --mock --profile 张老师   # Mock mode with specific profile
+    callmate --mock-stream            # Stream mock: simulated real-time events
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from callmate.core.advisor import create_advisor, MockAdvisor
 from callmate.core.presenter import Presenter
 from callmate.core.command_handler import CommandHandler
 from callmate.storage.profile_store import ProfileStore, Profile
+from callmate.utils.mock_stream import MockStreamer, demo_conversation
 
 
 def main():
@@ -34,15 +36,23 @@ def main():
     presenter = Presenter(profile_name=profile.name if profile else "")
     cmd_handler = _build_command_handler(presenter, dialogue_mgr, profile_store, advisor)
     presenter.start()
-    presenter.set_status("Mock 模式 — 输入对话内容（双方）")
 
-    print("\n" + "=" * 60, file=sys.stderr)
-    print(" CallMate Mock 模式", file=sys.stderr)
-    print(" 直接输入对话内容，CallMate 会给出建议", file=sys.stderr)
-    print(" 输入 /help 查看所有命令", file=sys.stderr)
-    print("=" * 60 + "\n", file=sys.stderr)
-
-    _run_mock_loop(presenter, dialogue_mgr, advisor, profile, cmd_handler, profile_store)
+    if args.mock_stream:
+        presenter.set_status("Mock Stream 模式 — 模拟流式输入")
+        print("\n" + "=" * 60, file=sys.stderr)
+        print(" CallMate Mock Stream 模式", file=sys.stderr)
+        print(" 对方在流式说话，你随时可以打字回复", file=sys.stderr)
+        print(" 输入 /help 查看所有命令", file=sys.stderr)
+        print("=" * 60 + "\n", file=sys.stderr)
+        _run_mock_stream_loop(presenter, dialogue_mgr, advisor, profile, cmd_handler, profile_store)
+    else:
+        presenter.set_status("Mock 模式 — 输入对话内容（双方）")
+        print("\n" + "=" * 60, file=sys.stderr)
+        print(" CallMate Mock 模式", file=sys.stderr)
+        print(" 输入对方说的话，CallMate 会给出建议", file=sys.stderr)
+        print(" 输入 /help 查看所有命令", file=sys.stderr)
+        print("=" * 60 + "\n", file=sys.stderr)
+        _run_mock_loop(presenter, dialogue_mgr, advisor, profile, cmd_handler, profile_store)
 
     presenter.stop()
     sys.exit(0)
@@ -121,6 +131,78 @@ def _handle_call_end(
             print(f"  对象已保存: {name}", file=sys.stderr)
 
     presenter.set_status("通话已结束。输入 /quit 退出。")
+
+
+# ---------------------------------------------------------------------------
+# Mock Stream loop (simulated real-time events)
+# ---------------------------------------------------------------------------
+
+def _run_mock_stream_loop(
+    presenter: Presenter,
+    dialogue_mgr: DialogueManager,
+    advisor: MockAdvisor,
+    profile,
+    cmd_handler: CommandHandler,
+    profile_store: ProfileStore,
+):
+    """Stream mock: MockStreamer generates events, user types replies."""
+    import threading
+
+    streamer = MockStreamer()
+    suggestions_lock = threading.Lock()
+    pending_suggestions = None
+
+    def on_utterance_end(text: str, speaker: int):
+        nonlocal pending_suggestions
+        role = "other" if speaker == 0 else "user"
+
+        # Add to dialogue
+        dialogue_mgr.add_message(role, text)
+
+        # Update UI
+        presenter.add_message(role, text)
+
+        # Trigger advisor only for other person's speech
+        if speaker == 0:
+            soul, profile_text, transcript = dialogue_mgr.build_prompt(profile)
+            suggestions = advisor.advise(soul, profile_text, transcript)
+            with suggestions_lock:
+                pending_suggestions = suggestions
+            presenter.update_suggestions(suggestions)
+            presenter.set_status("对方说完了，你可以回复了")
+        else:
+            presenter.update_suggestions([])
+
+    streamer.on_utterance_end(on_utterance_end)
+    streamer.on_results(lambda text, speaker, is_final, speech_final: None)
+    streamer.on_speech_started(lambda speaker: presenter.set_status(
+        "对方正在说话…" if speaker == 0 else ""
+    ))
+
+    # Start streamer in background
+    t = threading.Thread(target=streamer.run, daemon=True)
+    t.start()
+
+    # Main loop: user can type replies at any time
+    while True:
+        user_input = presenter.get_input()
+        if not user_input:
+            continue
+
+        cmd = CommandHandler.parse(user_input)
+        if cmd:
+            if cmd.name in ("quit", "end"):
+                _handle_call_end(presenter, dialogue_mgr, profile, profile_store)
+                break
+            response = cmd_handler.execute(cmd)
+            if response:
+                for line in response.split("\n"):
+                    presenter.add_message("system", line)
+            continue
+
+        # User typed their own response
+        dialogue_mgr.add_message("user", user_input)
+        presenter.add_message("user", user_input)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +292,7 @@ def _build_command_handler(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CallMate — real-time call assistant")
     parser.add_argument("--mock", action="store_true", help="Mock mode (type text, no audio)")
+    parser.add_argument("--mock-stream", action="store_true", help="Stream mock (simulated real-time events)")
     parser.add_argument("--profile", type=str, help="Profile name to use")
     return parser.parse_args()
 
