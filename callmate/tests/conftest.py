@@ -1,6 +1,6 @@
 import tempfile
 import pytest
-from storage.profile_store import ProfileStore
+from callmate.storage.profile_store import ProfileStore
 
 @pytest.fixture
 def profile_store():

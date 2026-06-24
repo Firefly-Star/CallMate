@@ -1,8 +1,8 @@
 """Tests for dialogue_manager."""
 import tempfile
 from pathlib import Path
-from storage.profile_store import Profile
-from core.dialogue_manager import DialogueManager
+from callmate.storage.profile_store import Profile
+from callmate.core.dialogue_manager import DialogueManager
 
 
 def _make_dm() -> tuple[DialogueManager, str]:

@@ -1,5 +1,5 @@
 """Tests for profile_store."""
-from storage.profile_store import ProfileStore, Profile
+from callmate.storage.profile_store import ProfileStore, Profile
 
 
 class TestProfileStore:

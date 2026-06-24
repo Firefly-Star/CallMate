@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from storage.profile_store import Profile
+from callmate.storage.profile_store import Profile
 
 
 # ---------------------------------------------------------------------------
